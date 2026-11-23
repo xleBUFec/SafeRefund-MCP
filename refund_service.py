@@ -6,23 +6,34 @@ single smart refund tool:
 
     1. get_order_details          — look up an order
     2. check_refund_policy        — validate the refund against store policy
-    3. calculate_refund_amount    — compute the exact amount to return
-    4. execute_refund_transaction — mark the order refunded and persist it
+    3. calculate_refund_amount    — compute the exact amount and issue a quote
+    4. execute_refund_transaction — execute a quote: mark the order refunded
     5. send_refund_notification   — build the customer-facing receipt
 
-Data lives in ``store_db.json`` (in the current working directory). If the file
-does not exist, it is created automatically and seeded with mock orders.
+Money can only move through a quote: ``calculate_refund_amount`` records the
+amount under a short-lived, single-use ``quote_id``, and
+``execute_refund_transaction`` accepts that ``quote_id`` instead of a raw
+amount. The caller can never invent an amount, and the amount executed is
+exactly the amount that was shown to the user.
+
+Data lives in ``store_db.json`` next to this file. If the file does not exist,
+it is created automatically and seeded with mock orders.
 
 Only the Python standard library is used.
 """
 
 import json
+import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-DB_PATH: str = "store_db.json"
+# Resolved relative to this file, so MCP hosts that launch the server from a
+# different working directory still use the same database.
+DB_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "store_db.json")
 
 REFUND_WINDOW_DAYS: int = 30
+QUOTE_TTL_MINUTES: int = 15
 NON_REFUNDABLE_CATEGORIES: List[str] = ["digital", "perishable"]
 VALID_STATUSES: List[str] = ["delivered", "refunded", "in_transit"]
 
@@ -114,7 +125,18 @@ def _build_mock_data() -> Dict[str, Any]:
                     "refunded_at": _iso(now - timedelta(days=3)),
                 },
             },
+            "ORD-105": {
+                "order_id": "ORD-105",
+                "customer": {"name": "Eve Davis", "email": "eve@example.com"},
+                "product": {"name": "Coffee Grinder", "category": "home"},
+                "amount": 95.0,
+                "currency": "USD",
+                "purchase_date": _iso(now - timedelta(days=1)),
+                "status": "in_transit",
+                "refund": None,
+            },
         },
+        "quotes": {},
         "transactions": [
             {
                 "refund_id": "RF-ORD-104-SEED",
@@ -304,12 +326,16 @@ def check_refund_policy(order_id: str, reason: str) -> dict:
 
 def calculate_refund_amount(order_id: str, reason: str) -> dict:
     """
-    Calculate the exact refund amount for an order.
+    Calculate the exact refund amount for an order and issue a refund quote.
 
     * ``defective``    → 100% of the paid amount.
     * ``changed_mind`` → 90% of the paid amount (10% return-shipping fee withheld).
 
-    This function only calculates; it does not check policy or change any data.
+    The amount is recorded under a single-use ``quote_id`` that expires after
+    15 minutes. ``execute_refund_transaction`` only accepts a ``quote_id``, so
+    show this amount to the user and pass the ``quote_id`` on once they agree.
+
+    This function does not check policy and does not change the order.
 
     Args:
         order_id (str): Order identifier, e.g. ``"ORD-101"``.
@@ -325,7 +351,9 @@ def calculate_refund_amount(order_id: str, reason: str) -> dict:
                 "fee_percent": float,      # 0.0 or 10.0
                 "fee_amount": float,
                 "refund_amount": float,    # rounded to 2 decimals
-                "currency": str
+                "currency": str,
+                "quote_id": str,           # pass to execute_refund_transaction
+                "quote_expires_at": str    # ISO 8601, UTC
             }
 
     Raises:
@@ -339,6 +367,22 @@ def calculate_refund_amount(order_id: str, reason: str) -> dict:
     refund_amount = round(original * REFUND_RATES[normalized_reason], 2)
     fee_amount = round(original - refund_amount, 2)
 
+    now = _now()
+    quote_id = f"Q-{order['order_id']}-{secrets.token_hex(4).upper()}"
+    expires_at = _iso(now + timedelta(minutes=QUOTE_TTL_MINUTES))
+
+    db = _load_db()
+    db.setdefault("quotes", {})[quote_id] = {
+        "quote_id": quote_id,
+        "order_id": order["order_id"],
+        "reason": normalized_reason,
+        "refund_amount": refund_amount,
+        "created_at": _iso(now),
+        "expires_at": expires_at,
+        "used": False,
+    }
+    _save_db(db)
+
     return {
         "order_id": order["order_id"],
         "reason": normalized_reason,
@@ -347,6 +391,8 @@ def calculate_refund_amount(order_id: str, reason: str) -> dict:
         "fee_amount": fee_amount,
         "refund_amount": refund_amount,
         "currency": order["currency"],
+        "quote_id": quote_id,
+        "quote_expires_at": expires_at,
     }
 
 
@@ -354,19 +400,19 @@ def calculate_refund_amount(order_id: str, reason: str) -> dict:
 # 4. Refund execution
 # ---------------------------------------------------------------------------
 
-def execute_refund_transaction(order_id: str, amount: float) -> dict:
+def execute_refund_transaction(order_id: str, quote_id: str) -> dict:
     """
-    Execute a refund: set the order status to ``refunded`` and persist the
-    transaction (amount and timestamp) in ``store_db.json``.
+    Execute a refund quote: set the order status to ``refunded`` and persist
+    the transaction (amount and timestamp) in ``store_db.json``.
 
-    As a last line of defence this function refuses to double-refund an order,
-    refund an undelivered order, or refund more than was paid. It does NOT
-    re-check the 30-day window or category rules — call
-    ``check_refund_policy`` first.
+    The amount is taken from the quote issued by ``calculate_refund_amount``;
+    it cannot be passed in directly. As a last line of defence this function
+    re-runs the full refund policy (window, category, status, reason) and
+    refuses unknown, expired, already used, or mismatched quotes.
 
     Args:
         order_id (str): Order identifier, e.g. ``"ORD-101"``.
-        amount (float): Amount to refund. Must be > 0 and <= the paid amount.
+        quote_id (str): ``quote_id`` returned by ``calculate_refund_amount``.
 
     Returns:
         dict::
@@ -375,6 +421,7 @@ def execute_refund_transaction(order_id: str, amount: float) -> dict:
                 "success": True,
                 "refund_id": str,          # e.g. "RF-ORD-101-20261123143005"
                 "order_id": str,
+                "quote_id": str,
                 "amount": float,
                 "currency": str,
                 "refunded_at": str,        # ISO 8601, UTC
@@ -383,39 +430,53 @@ def execute_refund_transaction(order_id: str, amount: float) -> dict:
 
     Raises:
         OrderNotFoundError: If the order does not exist.
-        RefundNotAllowedError: If the order is already refunded, not delivered,
-            or ``amount`` is not a positive number <= the paid amount.
+        RefundNotAllowedError: If the quote is unknown, expired, already used
+            or issued for another order, or the refund violates store policy.
     """
     db = _load_db()
     order = _get_order(db, order_id)
 
-    if order["status"] == "refunded":
-        raise RefundNotAllowedError(f"Order '{order['order_id']}' has already been refunded.")
-    if order["status"] != "delivered":
+    quote = db.get("quotes", {}).get(quote_id) if isinstance(quote_id, str) else None
+    if quote is None:
         raise RefundNotAllowedError(
-            f"Order '{order['order_id']}' has status '{order['status']}'; "
-            "only delivered orders can be refunded."
+            f"Unknown quote_id '{quote_id}'. Call calculate_refund_amount first."
         )
-    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-        raise RefundNotAllowedError("amount must be a number.")
-    amount = round(float(amount), 2)
-    if amount <= 0:
-        raise RefundNotAllowedError("amount must be greater than 0.")
-    if amount > order["amount"]:
+    if quote["order_id"] != order["order_id"]:
         raise RefundNotAllowedError(
-            f"amount {amount:.2f} exceeds the paid amount {order['amount']:.2f}."
+            f"Quote '{quote_id}' was issued for order '{quote['order_id']}', "
+            f"not '{order['order_id']}'."
+        )
+    if quote["used"]:
+        raise RefundNotAllowedError(f"Quote '{quote_id}' has already been used.")
+    if _now() >= datetime.fromisoformat(quote["expires_at"]):
+        raise RefundNotAllowedError(
+            f"Quote '{quote_id}' expired at {quote['expires_at']}. Request a new quote."
+        )
+
+    policy = check_refund_policy(order["order_id"], quote["reason"])
+    if not policy["eligible"]:
+        raise RefundNotAllowedError(
+            "Refund violates store policy: " + " ".join(policy["violations"])
+        )
+
+    amount = round(float(quote["refund_amount"]), 2)
+    if not 0 < amount <= order["amount"]:
+        raise RefundNotAllowedError(
+            f"Quoted amount {amount:.2f} is outside (0, {order['amount']:.2f}]."
         )
 
     now = _now()
     refund_id = f"RF-{order['order_id']}-{now.strftime('%Y%m%d%H%M%S')}"
     refunded_at = _iso(now)
 
+    quote["used"] = True
     order["status"] = "refunded"
     order["refund"] = {"refund_id": refund_id, "amount": amount, "refunded_at": refunded_at}
     db["transactions"].append(
         {
             "refund_id": refund_id,
             "order_id": order["order_id"],
+            "quote_id": quote_id,
             "amount": amount,
             "refunded_at": refunded_at,
         }
@@ -426,6 +487,7 @@ def execute_refund_transaction(order_id: str, amount: float) -> dict:
         "success": True,
         "refund_id": refund_id,
         "order_id": order["order_id"],
+        "quote_id": quote_id,
         "amount": amount,
         "currency": order["currency"],
         "refunded_at": refunded_at,
@@ -476,6 +538,8 @@ def send_refund_notification(order_id: str, refund_id: str, amount: float) -> di
             f"refund_id '{refund_id}' does not match the recorded refund "
             f"'{refund['refund_id']}' for order '{order['order_id']}'."
         )
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        raise RefundNotAllowedError("amount must be a number.")
     if round(float(amount), 2) != round(float(refund["amount"]), 2):
         raise RefundNotAllowedError(
             f"amount {float(amount):.2f} does not match the recorded refund "
@@ -511,7 +575,7 @@ def send_refund_notification(order_id: str, refund_id: str, amount: float) -> di
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    for oid in ["ORD-101", "ORD-102", "ORD-103", "ORD-104"]:
+    for oid in ["ORD-101", "ORD-102", "ORD-103", "ORD-104", "ORD-105"]:
         details = get_order_details(oid)
         policy = check_refund_policy(oid, "defective")
         verdict = "ELIGIBLE" if policy["eligible"] else "REJECTED: " + " ".join(policy["violations"])
